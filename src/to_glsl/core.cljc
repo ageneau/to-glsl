@@ -6,90 +6,161 @@
     [clojure.string :as string]
     [fipp.engine :as fipp]))
 
+(declare compile-form)
+(declare compile-symbol)
+
+(defrecord GLSLPrinter [state]
+  fipp.visit/IVisitor
+  (visit-meta [this meta x]
+    (fipp.visit/visit* this x))
+  (visit-string [this x]
+    [:text "\"" x "\""])
+  (visit-number [this x]
+    [:text (str x)])
+  (visit-boolean [this x]
+    [:text (str x)])
+  (visit-seq [this x]
+    (compile-form {:visit (partial fipp.visit/visit this) :state state} x))
+  (visit-symbol [this x]
+    (compile-symbol {:visit (partial fipp.visit/visit this) :state state} x)))
+
 (defn- compile-symbol
-  [_ x]
+  [{:keys [state]} x]
   (let [x-str (str x)]
     [:text (if (string/starts-with? x-str "gl/")
              (str "gl_" (csk/->PascalCase (string/replace x-str "gl/" "")))
-             (str (csk/->camelCase x-str)))]))
+             (str x))]))
 
 (defn- compile-typed
-  [visit definition]
+  [context definition]
   (let [arg (last definition)
         arg-type (drop-last definition)]
-    [:span [:text (string/join " " (map #(csk/->camelCase (str %)) arg-type))] " " (compile-symbol visit arg)]))
+    [:span [:text (string/join " " (map #(csk/->camelCase (str %)) arg-type))] " " (compile-symbol context arg)]))
 
 (defn- compile-def
-  [visit [_ t n initial-value]]
-  [:span (compile-typed visit (flatten [t n])) (if initial-value [:span [:text " = "] (visit initial-value)]) ])
+  [{:keys [visit] :as context} [_ t n initial-value]]
+  (into [:span] (concat (list (compile-typed context (flatten [t n])))
+                        (when initial-value [[:span [:text " = "] (visit initial-value)]]))))
 
 (defn- compile-def-varying
-  [visit x]
-  (into [:span "varying "] (compile-def visit x)))
+  [context x]
+  (into [:span "varying "] (compile-def context x)))
 
 (defn- compile-def-uniform
-  [visit x]
-  (into [:span "uniform "] (compile-def visit x)))
+  [context x]
+  (into [:span "uniform "] (compile-def context x)))
 
 (defn- compile-def-attribute
-  [visit x]
-  (into [:span "attribute "] (compile-def visit x)))
+  [context x]
+  (into [:span "attribute "] (compile-def context x)))
 
 (defn- compile-do
-  [visit [_ & forms]]
-  [:group
-   (map (fn [x] [:group
-                 (visit x)
-                 (if (not (contains? #{'if 'when 'defn} (first x)))
-                   ";")
-                 :break]) forms)])
+  [{:keys [visit]} [_ & forms]]
+  (into [:group]
+        (map (fn [x] (into [:group]
+                           (concat [(visit x)]
+                                   (when-not (contains? #{'if 'when 'defn 'pre.if 'pre.ifdef 'pre.cond 'pre.include} (first x)) [";"])
+                                   [:break]))) forms)))
 
 (defn- compile-defn
-  [visit [_ n  [return-type args] & body]]
+  [{:keys [visit] :as context} [_ n  [return-type args] & body]]
   [:span
    [:text return-type " " (csk/->camelCase n)]
-   [:group "(" (interpose ", " (map (partial compile-typed visit) args)) ") "]
+   [:group "(" (interpose ", " (map (partial compile-typed context) args)) ") "]
    [:group "{" :break [:nest 2 (visit `(do ~@body))] "}"]])
 
 (defn- compile-when
-  [visit [_ condition & body]]
+  [{:keys [visit]} [_ condition & body]]
   [:span "if (" (visit condition) ") " [:group "{" :break [:nest 2 (visit `(do ~@body))] "}"]])
 
 (defn- compile-if
-  [visit [_ condition success fail]]
+  [{:keys [visit]} [_ condition success fail]]
   [:span (visit condition) " ? " (visit success) " : " (visit fail)])
 
+(defn- make-doable [form]
+  (if (= 'do (first form)) form (list 'do form)))
+
+
+(defn- compile-pre-include
+  [_ [_ file]]
+  [:span "#include<" (str file) ">"])
+
+(defn- compile-pre-ifdef
+  [{:keys [visit state] :as context} [_ condition success fail]]
+  (into [:group]
+        (concat [[:span "#ifdef "
+                  (fipp.visit/visit (GLSLPrinter. (assoc state :preprocessor? true)) condition)]]
+                [:break]
+                (compile-do context (make-doable success))
+                (when fail [[:line "#else" :line]
+                            (compile-do context (make-doable fail))])
+
+                ["#endif"])))
+
+(defn- compile-pre-if
+  [{:keys [visit state] :as context} [_ condition success fail]]
+  (into [:group]
+        (concat [:span "#if " (fipp.visit/visit (GLSLPrinter. (assoc state :preprocessor? true)) condition)]
+                [:break]
+                (compile-do context (make-doable success))
+                (when fail [[:line "#else" :line]
+                            (compile-do context (make-doable fail))])
+                ["#endif"])))
+
+
+(defn- compile-pre-cond
+  [{:keys [visit state] :as context} [_ & clauses]]
+  {:pre [even? (count clauses)]}
+  (into [:group]
+        (concat (map-indexed (fn [k [test expr]]
+                               (let [expr-pp (compile-do context (make-doable expr))]
+                                 (concat (into [:span]
+                                               (if (= :else test)
+                                                 ["#else"]
+                                                 (let [test-pp (fipp.visit/visit (GLSLPrinter. (assoc state :preprocessor? true)) test)]
+                                                   (if (zero? k)
+                                                     ["#if " test-pp]
+                                                     ["#elif " test-pp]))))
+                                         [:break]
+                                         expr-pp)))
+                             (partition 2 clauses))
+                ["#endif"])))
+
 (defn- compile-set!
-  [visit [_ dest source]]
-  [:span (compile-symbol visit dest) " = " (visit source) ])
+  [{:keys [visit] :as context} [_ dest source]]
+  [:span (compile-symbol context dest) " = " (visit source) ])
 
 (defn- compile-inc
-  [visit [_ n]]
-  [:span (compile-symbol visit n) "++"])
+  [context [_ n]]
+  [:span (compile-symbol context n) "++"])
 
 (defn- compile-dec
-  [visit [_ n]]
-  [:span (compile-symbol visit n) "--"])
+  [context [_ n]]
+  [:span (compile-symbol context n) "--"])
 
 (defn- compile-field
-  [visit [_ n access]]
-  [:span (compile-symbol visit n) "." (str access)])
+  [context [_ n access]]
+  [:span (compile-symbol context n) "." (str access)])
 
 (defn- compile-swizzle
-  [visit [_ n & elements]]
-  [:span (compile-symbol visit n) "." (string/join (map str elements))])
+  [context [_ n & elements]]
+  [:span (compile-symbol context n) "." (string/join (map str elements))])
 
 (defn- compile-default
-  [visit [n & args]]
-  [:group (compile-symbol visit n) "(" (interpose ", " (map visit args)) ")"])
+  [{:keys [visit] :as context} [n & args]]
+  (into [:group] (concat [(compile-symbol context n)]
+                         ["("]
+                         (interpose ", " (map visit args))
+                         [")"])))
 
 (defn- infix
   [op]
-  (fn [visit [_ & args]]
-    [:span (interpose (str " " op " ") (map visit args))]))
+  (fn [{:keys [visit]} [_ & args]]
+    (into [:span]
+          (interpose (str " " op " ") (map visit args)))))
 
 (defn- compile-form
-  [printer x]
+  [context x]
   (let [compile-fn
         (condp = (first x)
           'defn compile-defn
@@ -99,6 +170,10 @@
           'def-attribute compile-def-attribute
           'when compile-when
           'if compile-if
+          'pre.ifdef compile-pre-ifdef
+          'pre.if compile-pre-if
+          'pre.cond compile-pre-cond
+          'pre.include compile-pre-include
           'and (infix "&&")
           'or (infix "||")
           '= (infix "==")
@@ -106,6 +181,10 @@
           '- (infix "-")
           '/ (infix "/")
           '* (infix "*")
+          '> (infix ">")
+          '>= (infix ">=")
+          '< (infix "<")
+          '<= (infix "<=")
           'set! compile-set!
           'bit-and (infix "&")
           'bit-or (infix "|")
@@ -119,26 +198,11 @@
           'swizzle compile-swizzle
           'do compile-do
           compile-default)]
-    (compile-fn (partial fipp.visit/visit printer) x)))
+    (compile-fn context x)))
 
-(defrecord GLSLPrinter []
-  fipp.visit/IVisitor
-  (visit-meta [this meta x]
-    (fipp.visit/visit* this x))
-  (visit-string [this x]
-    [:text "\"" x "\""])
-  (visit-number [this x]
-    [:text (str x)])
-  (visit-boolean [this x]
-    [:text (str x)])
-  (visit-seq [this x]
-    (compile-form this x))
-  (visit-symbol [this x]
-    (compile-symbol this x)))
-
-(defn- pretty
+(defn pretty
   [x]
-  (fipp.visit/visit (GLSLPrinter.) x))
+  (fipp.visit/visit (GLSLPrinter. {}) x))
 
 (defn locations
   [form]
